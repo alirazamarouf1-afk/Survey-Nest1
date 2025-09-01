@@ -8,21 +8,6 @@ import sys
 from io import BytesIO
 from datetime import datetime
 
-# Check if openpyxl is installed, otherwise show instructions
-try:
-    from openpyxl import Workbook, load_workbook
-    openpyxl_available = True
-except ImportError:
-    openpyxl_available = False
-    st.error("""
-    **openpyxl library is not installed.**
-    
-    To install it, run: `pip install openpyxl`
-    
-    If you're running this locally, please install the required library.
-    If you're on Streamlit Cloud, add `openpyxl` to your requirements.txt file.
-    """)
-
 # ----------------------------
 # Configuration / Constants
 # ----------------------------
@@ -118,49 +103,47 @@ def create_empty_project(owner, title):
     return pid, project
 
 def export_xlsform_to_bytes(project):
-    if not openpyxl_available:
-        st.error("openpyxl is required for XLSForm export. Please install it.")
-        return BytesIO()
-    
-    wb = Workbook()
-    # Survey sheet
-    ws1 = wb.active
-    ws1.title = "survey"
-    ws1.append(["type", "name", "label", "required"])
+    # Create survey sheet
+    survey_data = []
     for q in project["form"]:
         qtype = q["type"]
-        # for selects, use select_one/listname pattern where listname is the question name
         if qtype in ["select_one", "select_multiple"]:
-            qtype_str = f"{qtype} {q['name']}"  # note: space separated is OK in many XLSForm editors; alternate: select_one listname
-            ws1.append([qtype_str, q["name"], q["label"], "yes" if q.get("required") else ""])
+            qtype_str = f"{qtype} {q['name']}"
         else:
-            ws1.append([qtype, q["name"], q["label"], "yes" if q.get("required") else ""])
-    # Choices sheet
-    ws2 = wb.create_sheet("choices")
-    ws2.append(["list_name", "name", "label"])
+            qtype_str = qtype
+        survey_data.append({
+            "type": qtype_str,
+            "name": q["name"],
+            "label": q["label"],
+            "required": "yes" if q.get("required") else ""
+        })
+    
+    # Create choices sheet
+    choices_data = []
     for q in project["form"]:
         if q.get("choices"):
             list_name = q["name"]
             for i, ch in enumerate(q["choices"], start=1):
-                ws2.append([list_name, f"opt{i}", ch])
-    # Save to bytes
+                choices_data.append({
+                    "list_name": list_name,
+                    "name": f"opt{i}",
+                    "label": ch
+                })
+    
+    # Create Excel file using pandas
     bio = BytesIO()
-    wb.save(bio)
+    with pd.ExcelWriter(bio, engine='xlsxwriter') as writer:
+        pd.DataFrame(survey_data).to_excel(writer, sheet_name='survey', index=False)
+        if choices_data:
+            pd.DataFrame(choices_data).to_excel(writer, sheet_name='choices', index=False)
+    
     bio.seek(0)
     return bio
 
 def export_data_to_excel_bytes(project):
     df = pd.DataFrame(project["data"])
     bio = BytesIO()
-    
-    # Use pandas built-in Excel writer if openpyxl is not available
-    if openpyxl_available:
-        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="submissions")
-    else:
-        # Fallback: create a simple CSV in memory
-        bio.write(df.to_csv(index=False).encode('utf-8'))
-    
+    df.to_excel(bio, index=False, engine='xlsxwriter')
     bio.seek(0)
     return bio
 
@@ -169,70 +152,63 @@ def export_data_to_excel_bytes(project):
 # ----------------------------
 def import_xlsform(file_bytes, project):
     """
-    Import questions from an XLSForm Excel file
+    Import questions from an XLSForm Excel file using pandas
     """
-    if not openpyxl_available:
-        st.error("openpyxl is required for XLSForm import. Please install it.")
-        return False
-        
     try:
-        # Load the workbook
-        wb = load_workbook(BytesIO(file_bytes))
+        # Read the Excel file
+        xls = pd.ExcelFile(BytesIO(file_bytes))
         
-        # Get survey sheet
-        if 'survey' not in wb.sheetnames:
+        # Check if survey sheet exists
+        if 'survey' not in xls.sheet_names:
             st.error("XLSForm must contain a 'survey' sheet")
             return False
             
-        survey_sheet = wb['survey']
-        choices_sheet = wb['choices'] if 'choices' in wb.sheetnames else None
+        # Read survey sheet
+        survey_df = pd.read_excel(xls, sheet_name='survey')
         
-        # Parse survey questions
+        # Check required columns
+        required_columns = ['type', 'name', 'label']
+        for col in required_columns:
+            if col not in survey_df.columns:
+                st.error(f"XLSForm must contain '{col}' column in survey sheet")
+                return False
+        
+        # Read choices sheet if it exists
+        choices_df = None
+        if 'choices' in xls.sheet_names:
+            choices_df = pd.read_excel(xls, sheet_name='choices')
+        
+        # Process each row in survey sheet
         questions = []
-        headers = [cell.value for cell in survey_sheet[1]]
-        
-        # Find column indices
-        type_idx = headers.index('type') if 'type' in headers else None
-        name_idx = headers.index('name') if 'name' in headers else None
-        label_idx = headers.index('label') if 'label' in headers else None
-        required_idx = headers.index('required') if 'required' in headers else None
-        
-        if type_idx is None or name_idx is None or label_idx is None:
-            st.error("XLSForm must contain 'type', 'name', and 'label' columns in survey sheet")
-            return False
-        
-        # Process each row in survey sheet (skip header)
-        for row in survey_sheet.iter_rows(min_row=2, values_only=True):
-            if not row or not row[type_idx]:
+        for _, row in survey_df.iterrows():
+            if pd.isna(row['type']) or pd.isna(row['name']) or pd.isna(row['label']):
                 continue
                 
-            q_type = row[type_idx]
-            q_name = row[name_idx]
-            q_label = row[label_idx]
-            q_required = row[required_idx] if required_idx is not None and row[required_idx] else False
+            q_type = str(row['type'])
+            q_name = str(row['name'])
+            q_label = str(row['label'])
+            q_required = row['required'] if 'required' in row and not pd.isna(row['required']) else False
             
             # Handle select question types
             choices = []
-            if q_type and isinstance(q_type, str) and q_type.startswith(('select_one', 'select_multiple')):
-                # Extract list name from type (e.g., "select_one gender" -> "gender")
+            if q_type.startswith(('select_one', 'select_multiple')):
+                # Extract list name from type
                 list_name = q_type.split(' ', 1)[1] if ' ' in q_type else q_name
                 
                 # Find choices for this list
-                if choices_sheet:
-                    choices_headers = [cell.value for cell in choices_sheet[1]]
-                    list_name_idx = choices_headers.index('list_name') if 'list_name' in choices_headers else None
-                    name_idx = choices_headers.index('name') if 'name' in choices_headers else None
-                    label_idx = choices_headers.index('label') if 'label' in choices_headers else None
-                    
-                    if list_name_idx is not None and name_idx is not None and label_idx is not None:
-                        for choice_row in choices_sheet.iter_rows(min_row=2, values_only=True):
-                            if choice_row and choice_row[list_name_idx] == list_name:
-                                choices.append(choice_row[label_idx] if choice_row[label_idx] else choice_row[name_idx])
+                if choices_df is not None and 'list_name' in choices_df.columns:
+                    list_choices = choices_df[choices_df['list_name'] == list_name]
+                    if not list_choices.empty:
+                        for _, choice_row in list_choices.iterrows():
+                            if 'label' in choice_row and not pd.isna(choice_row['label']):
+                                choices.append(str(choice_row['label']))
+                            elif 'name' in choice_row and not pd.isna(choice_row['name']):
+                                choices.append(str(choice_row['name']))
             
             # Normalize question type
-            if q_type and isinstance(q_type, str) and q_type.startswith('select_one'):
+            if q_type.startswith('select_one'):
                 normalized_type = 'select_one'
-            elif q_type and isinstance(q_type, str) and q_type.startswith('select_multiple'):
+            elif q_type.startswith('select_multiple'):
                 normalized_type = 'select_multiple'
             else:
                 normalized_type = q_type
@@ -307,10 +283,6 @@ st.title("📋 Survey Nest — Form Builder & Data Collector ")
 st.markdown("Survey Nest is a free and open-source suite of tools for data collection, management, and analysis.")
 st.markdown("Developed for humanitarian, research, and field survey projects.")
 st.markdown("Supports offline data collection and mobile use, making it ideal for challenging environments.")
-
-# Show warning if openpyxl is not available
-if not openpyxl_available:
-    st.warning("XLSForm import/export features are disabled because openpyxl is not installed.")
 
 show_auth_sidebar()
 
@@ -398,20 +370,17 @@ with col_right:
             st.subheader("Form Designer")
             st.markdown("Add questions to your form. Supported types: text, integer, decimal, date, select_one, select_multiple, note.")
             
-            # Add XLSForm import section (only if openpyxl is available)
-            if openpyxl_available:
-                st.markdown("### Import from XLSForm")
-                uploaded_file = st.file_uploader("Upload XLSForm (.xlsx)", type=["xlsx"], key="xls_upload")
-                if uploaded_file is not None:
-                    if st.button("Import Questions from XLSForm"):
-                        success = import_xlsform(uploaded_file.getvalue(), project)
-                        if success:
-                            st.session_state.projects[user][pid] = project
-                            save_projects(st.session_state.projects)
-                            st.success("Questions imported successfully!")
-                            st.rerun()
-            else:
-                st.info("XLSForm import is disabled. Install openpyxl to enable this feature.")
+            # Add XLSForm import section
+            st.markdown("### Import from XLSForm")
+            uploaded_file = st.file_uploader("Upload XLSForm (.xlsx)", type=["xlsx"], key="xls_upload")
+            if uploaded_file is not None:
+                if st.button("Import Questions from XLSForm"):
+                    success = import_xlsform(uploaded_file.getvalue(), project)
+                    if success:
+                        st.session_state.projects[user][pid] = project
+                        save_projects(st.session_state.projects)
+                        st.success("Questions imported successfully!")
+                        st.rerun()
             
             # List current questions
             if project["form"]:
@@ -579,13 +548,10 @@ with col_right:
         with t4:
             st.subheader("Export")
             st.markdown("Export form as XLSForm (survey + choices) or download collected data.")
-            if openpyxl_available:
-                if st.button("Export XLSForm (download)"):
-                    xls_bytes = export_xlsform_to_bytes(project)
-                    st.download_button("Download XLSForm", xls_bytes, file_name=f"{project['title']}_xlsform.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                st.write("Tip: open the XLSForm in Excel or KoboToolbox 'Import XLSForm' to deploy it.")
-            else:
-                st.info("XLSForm export is disabled. Install openpyxl to enable this feature.")
+            if st.button("Export XLSForm (download)"):
+                xls_bytes = export_xlsform_to_bytes(project)
+                st.download_button("Download XLSForm", xls_bytes, file_name=f"{project['title']}_xlsform.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.write("Tip: open the XLSForm in Excel or KoboToolbox 'Import XLSForm' to deploy it.")
 
         # ----------------------------
         # SETTINGS
