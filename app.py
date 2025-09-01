@@ -4,7 +4,8 @@ import pandas as pd
 import hashlib
 import os
 import json
-from openpyxl import Workbook
+import sys
+from openpyxl import Workbook, load_workbook
 from io import BytesIO
 from datetime import datetime
 
@@ -12,14 +13,27 @@ from datetime import datetime
 # Configuration / Constants
 # ----------------------------
 st.set_page_config(page_title="Survey Nest", page_icon="📋", layout="wide")
-USER_FILE = "kc_users.csv"        # simple credentials store (username, password_hash)
-PROJECTS_FILE = "kc_projects.json"  # store projects and forms persistently while app file exists
+
+# Get application directory (works for both script and executable)
+def get_app_dir():
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        return os.path.dirname(sys.executable)
+    else:
+        # Running as script
+        return os.path.dirname(os.path.abspath(__file__))
+
+APP_DIR = get_app_dir()
+USER_FILE = os.path.join(APP_DIR, "kc_users.csv")        # simple credentials store (username, password_hash)
+PROJECTS_FILE = os.path.join(APP_DIR, "kc_projects.json")  # store projects and forms persistently while app file exists
 
 # ----------------------------
 # Helper: Storage (users/projects)
 # ----------------------------
 def ensure_user_file():
     if not os.path.exists(USER_FILE):
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(USER_FILE), exist_ok=True)
         pd.DataFrame(columns=["username", "password_hash"]).to_csv(USER_FILE, index=False)
 
 def hash_password(password: str) -> str:
@@ -44,11 +58,16 @@ def authenticate(username: str, password: str) -> bool:
 
 def load_projects():
     if os.path.exists(PROJECTS_FILE):
-        with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return {}
     return {}
 
 def save_projects(data):
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
     with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -121,6 +140,95 @@ def export_data_to_excel_bytes(project):
     return bio
 
 # ----------------------------
+# XLSForm Import Function
+# ----------------------------
+def import_xlsform(file_bytes, project):
+    """
+    Import questions from an XLSForm Excel file
+    """
+    try:
+        # Load the workbook
+        wb = load_workbook(BytesIO(file_bytes))
+        
+        # Get survey sheet
+        if 'survey' not in wb.sheetnames:
+            st.error("XLSForm must contain a 'survey' sheet")
+            return False
+            
+        survey_sheet = wb['survey']
+        choices_sheet = wb['choices'] if 'choices' in wb.sheetnames else None
+        
+        # Parse survey questions
+        questions = []
+        headers = [cell.value for cell in survey_sheet[1]]
+        
+        # Find column indices
+        type_idx = headers.index('type') if 'type' in headers else None
+        name_idx = headers.index('name') if 'name' in headers else None
+        label_idx = headers.index('label') if 'label' in headers else None
+        required_idx = headers.index('required') if 'required' in headers else None
+        
+        if type_idx is None or name_idx is None or label_idx is None:
+            st.error("XLSForm must contain 'type', 'name', and 'label' columns in survey sheet")
+            return False
+        
+        # Process each row in survey sheet (skip header)
+        for row in survey_sheet.iter_rows(min_row=2, values_only=True):
+            if not row or not row[type_idx]:
+                continue
+                
+            q_type = row[type_idx]
+            q_name = row[name_idx]
+            q_label = row[label_idx]
+            q_required = row[required_idx] if required_idx is not None and row[required_idx] else False
+            
+            # Handle select question types
+            choices = []
+            if q_type and isinstance(q_type, str) and q_type.startswith(('select_one', 'select_multiple')):
+                # Extract list name from type (e.g., "select_one gender" -> "gender")
+                list_name = q_type.split(' ', 1)[1] if ' ' in q_type else q_name
+                
+                # Find choices for this list
+                if choices_sheet:
+                    choices_headers = [cell.value for cell in choices_sheet[1]]
+                    list_name_idx = choices_headers.index('list_name') if 'list_name' in choices_headers else None
+                    name_idx = choices_headers.index('name') if 'name' in choices_headers else None
+                    label_idx = choices_headers.index('label') if 'label' in choices_headers else None
+                    
+                    if list_name_idx is not None and name_idx is not None and label_idx is not None:
+                        for choice_row in choices_sheet.iter_rows(min_row=2, values_only=True):
+                            if choice_row and choice_row[list_name_idx] == list_name:
+                                choices.append(choice_row[label_idx] if choice_row[label_idx] else choice_row[name_idx])
+            
+            # Normalize question type
+            if q_type and isinstance(q_type, str) and q_type.startswith('select_one'):
+                normalized_type = 'select_one'
+            elif q_type and isinstance(q_type, str) and q_type.startswith('select_multiple'):
+                normalized_type = 'select_multiple'
+            else:
+                normalized_type = q_type
+            
+            # Create question object
+            question = {
+                "id": new_id("q"),
+                "name": q_name,
+                "label": q_label,
+                "type": normalized_type,
+                "choices": choices,
+                "required": bool(q_required and str(q_required).lower() in ['yes', 'true', '1', 'required'])
+            }
+            
+            questions.append(question)
+        
+        # Add questions to project
+        project["form"].extend(questions)
+        return True
+        
+    except Exception as e:
+        st.error(f"Error importing XLSForm: {str(e)}")
+        return False
+
+# ----------------------------
 # Auth UI
 # ----------------------------
 def show_auth_sidebar():
@@ -129,6 +237,7 @@ def show_auth_sidebar():
     if choice == "Help":
         st.sidebar.markdown("This App stores users in a local CSV and projects in a JSON file in the app folder.")
         st.sidebar.markdown("Sign Up to create projects, then go to Dashboard.")
+        st.sidebar.markdown(f"**Data location:** {APP_DIR}")
         return
     if choice == "Sign Up":
         st.sidebar.subheader("Create account")
@@ -245,8 +354,6 @@ with col_right:
         st.header(f"Project: {project['title']}")
         st.markdown(f"**Owner:** {project['owner']} — **Created:** {project['created_at']}")
 
-        tab = st.tabs(["Form Designer", "Collect (Simulate)", "Data", "Export", "Settings"])[0]
-
         # Using tabs individually for richer UI
         t1, t2, t3, t4, t5 = st.tabs(["Form Designer", "Collect (Simulate)", "Data", "Export", "Settings"])
 
@@ -256,6 +363,19 @@ with col_right:
         with t1:
             st.subheader("Form Designer")
             st.markdown("Add questions to your form. Supported types: text, integer, decimal, date, select_one, select_multiple, note.")
+            
+            # Add XLSForm import section
+            st.markdown("### Import from XLSForm")
+            uploaded_file = st.file_uploader("Upload XLSForm (.xlsx)", type=["xlsx"], key="xls_upload")
+            if uploaded_file is not None:
+                if st.button("Import Questions from XLSForm"):
+                    success = import_xlsform(uploaded_file.getvalue(), project)
+                    if success:
+                        st.session_state.projects[user][pid] = project
+                        save_projects(st.session_state.projects)
+                        st.success("Questions imported successfully!")
+                        st.rerun()
+            
             # List current questions
             if project["form"]:
                 dfq = pd.DataFrame([{"#": i+1, "name": q["name"], "label": q["label"], "type": q["type"], "choices": ", ".join(q.get("choices", []))} for i, q in enumerate(project["form"])])
@@ -445,4 +565,3 @@ with col_right:
         # save back any changes
         st.session_state.projects[user][pid] = project
         save_projects(st.session_state.projects)
-
