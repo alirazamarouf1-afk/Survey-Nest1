@@ -5,7 +5,7 @@ import hashlib
 import os
 import json
 import sys
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from io import BytesIO
 from datetime import datetime
 
@@ -138,95 +138,6 @@ def export_data_to_excel_bytes(project):
         df.to_excel(writer, index=False, sheet_name="submissions")
     bio.seek(0)
     return bio
-
-# ----------------------------
-# XLSForm Import Function
-# ----------------------------
-def import_xlsform(file_bytes, project):
-    """
-    Import questions from an XLSForm Excel file
-    """
-    try:
-        # Load the workbook
-        wb = load_workbook(BytesIO(file_bytes))
-        
-        # Get survey sheet
-        if 'survey' not in wb.sheetnames:
-            st.error("XLSForm must contain a 'survey' sheet")
-            return False
-            
-        survey_sheet = wb['survey']
-        choices_sheet = wb['choices'] if 'choices' in wb.sheetnames else None
-        
-        # Parse survey questions
-        questions = []
-        headers = [cell.value for cell in survey_sheet[1]]
-        
-        # Find column indices
-        type_idx = headers.index('type') if 'type' in headers else None
-        name_idx = headers.index('name') if 'name' in headers else None
-        label_idx = headers.index('label') if 'label' in headers else None
-        required_idx = headers.index('required') if 'required' in headers else None
-        
-        if type_idx is None or name_idx is None or label_idx is None:
-            st.error("XLSForm must contain 'type', 'name', and 'label' columns in survey sheet")
-            return False
-        
-        # Process each row in survey sheet (skip header)
-        for row in survey_sheet.iter_rows(min_row=2, values_only=True):
-            if not row or not row[type_idx]:
-                continue
-                
-            q_type = row[type_idx]
-            q_name = row[name_idx]
-            q_label = row[label_idx]
-            q_required = row[required_idx] if required_idx is not None and row[required_idx] else False
-            
-            # Handle select question types
-            choices = []
-            if q_type and isinstance(q_type, str) and q_type.startswith(('select_one', 'select_multiple')):
-                # Extract list name from type (e.g., "select_one gender" -> "gender")
-                list_name = q_type.split(' ', 1)[1] if ' ' in q_type else q_name
-                
-                # Find choices for this list
-                if choices_sheet:
-                    choices_headers = [cell.value for cell in choices_sheet[1]]
-                    list_name_idx = choices_headers.index('list_name') if 'list_name' in choices_headers else None
-                    name_idx = choices_headers.index('name') if 'name' in choices_headers else None
-                    label_idx = choices_headers.index('label') if 'label' in choices_headers else None
-                    
-                    if list_name_idx is not None and name_idx is not None and label_idx is not None:
-                        for choice_row in choices_sheet.iter_rows(min_row=2, values_only=True):
-                            if choice_row and choice_row[list_name_idx] == list_name:
-                                choices.append(choice_row[label_idx] if choice_row[label_idx] else choice_row[name_idx])
-            
-            # Normalize question type
-            if q_type and isinstance(q_type, str) and q_type.startswith('select_one'):
-                normalized_type = 'select_one'
-            elif q_type and isinstance(q_type, str) and q_type.startswith('select_multiple'):
-                normalized_type = 'select_multiple'
-            else:
-                normalized_type = q_type
-            
-            # Create question object
-            question = {
-                "id": new_id("q"),
-                "name": q_name,
-                "label": q_label,
-                "type": normalized_type,
-                "choices": choices,
-                "required": bool(q_required and str(q_required).lower() in ['yes', 'true', '1', 'required'])
-            }
-            
-            questions.append(question)
-        
-        # Add questions to project
-        project["form"].extend(questions)
-        return True
-        
-    except Exception as e:
-        st.error(f"Error importing XLSForm: {str(e)}")
-        return False
 
 # ----------------------------
 # Auth UI
@@ -363,19 +274,6 @@ with col_right:
         with t1:
             st.subheader("Form Designer")
             st.markdown("Add questions to your form. Supported types: text, integer, decimal, date, select_one, select_multiple, note.")
-            
-            # Add XLSForm import section
-            st.markdown("### Import from XLSForm")
-            uploaded_file = st.file_uploader("Upload XLSForm (.xlsx)", type=["xlsx"], key="xls_upload")
-            if uploaded_file is not None:
-                if st.button("Import Questions from XLSForm"):
-                    success = import_xlsform(uploaded_file.getvalue(), project)
-                    if success:
-                        st.session_state.projects[user][pid] = project
-                        save_projects(st.session_state.projects)
-                        st.success("Questions imported successfully!")
-                        st.rerun()
-            
             # List current questions
             if project["form"]:
                 dfq = pd.DataFrame([{"#": i+1, "name": q["name"], "label": q["label"], "type": q["type"], "choices": ", ".join(q.get("choices", []))} for i, q in enumerate(project["form"])])
